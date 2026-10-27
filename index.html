@@ -4,16 +4,22 @@
 <meta charset="utf-8">
 <title>コイン集めゲーム</title>
 <style>
-  body { font-family: system-ui, sans-serif; margin: 16px; background: #f5f5f5; color: #222; }
-  #hud { font-size: 18px; margin-bottom: 6px; }
-  #hud span { margin-right: 28px; }
-  canvas { border: 1px solid #333; background: #111; display: block; }
-  .panel { border: 1px solid #ccc; background: #fff; padding: 12px; margin-top: 12px; max-width: 800px; }
+  :root { --bg: #0b0e17; --panel: #151a2a; --line: #2a3150; --text: #e8ecf5; --sub: #9aa3bd; --gold: #ffd23f; }
+  body { font-family: system-ui, sans-serif; margin: 16px; background: var(--bg); color: var(--text); }
+  #hud { font-size: 18px; margin-bottom: 6px; display: flex; align-items: center; gap: 28px; max-width: 800px; }
+  #hudCombo { color: var(--sub); min-width: 7em; }
+  #hudCombo.on { color: var(--gold); font-weight: bold; }
+  #btnMute { margin-left: auto; font-size: 13px; padding: 3px 10px; }
+  canvas { border-radius: 8px; background: #0e1220; display: block; box-shadow: 0 0 0 1px var(--line); }
+  .panel { border: 1px solid var(--line); border-radius: 8px; background: var(--panel); padding: 12px; margin-top: 12px; max-width: 774px; }
   .panel label { margin-right: 14px; }
   .panel input, .panel select { font-size: 14px; }
-  .note { color: #666; font-size: 13px; }
-  textarea { width: 100%; height: 220px; font-family: monospace; font-size: 11px; margin-top: 8px; }
-  button { font-size: 15px; padding: 6px 14px; }
+  .note { color: var(--sub); font-size: 13px; }
+  #rank { font-size: 40px; font-weight: bold; color: var(--gold); margin-right: 14px; }
+  #finalScore { font-size: 20px; }
+  textarea { width: 100%; height: 220px; font-family: monospace; font-size: 11px; margin-top: 8px; background: #0e1220; color: var(--sub); }
+  button { font-size: 15px; padding: 6px 14px; border-radius: 6px; border: 1px solid var(--line); background: #222a44; color: var(--text); cursor: pointer; }
+  button:hover { background: #2c365a; }
   .hidden { display: none; }
 </style>
 </head>
@@ -22,6 +28,8 @@
 <div id="hud">
   <span id="hudScore">スコア: 0</span>
   <span id="hudTime">残り: 60.0 秒</span>
+  <span id="hudCombo">コンボ ×1</span>
+  <button id="btnMute">音: オン</button>
 </div>
 
 <canvas id="cv" width="800" height="600"></canvas>
@@ -42,11 +50,12 @@
   </label>
   <label>セッション番号 <input id="inSession" value="01" size="4"></label></span>
   <button id="btnStart">スタート</button>
-  <p class="note">WASDで移動。60秒でコインを集める。</p>
+  <p class="note">WASD で移動して、60秒でコインを集める。2秒以内に続けて取るとコンボで1枚の得点が増える(最大3点)。</p>
 </div>
 
 <div id="endPanel" class="panel hidden">
-  <div id="finalScore"></div>
+  <div><span id="rank"></span><span id="finalScore"></span></div>
+  <p id="devInfo" class="note"></p>
   <p>
     <button id="btnNext" class="hidden">次へ</button> <button id="btnDownload">ログをダウンロード</button>
     <span id="fileNameLabel" class="note"></span>
@@ -90,11 +99,15 @@ const CONFIG = {
   E2_REWARD: 3,           // E2: 指示側 +3 / 罠 -3
   E3_DURATION_MS: 10000,  // E3 規則変更: 左右反転の継続時間
 
+  COMBO_WINDOW_MS: 2000,  // 前の取得からこの時間内に取るとコンボ倍率が1段上がる(v3)
+  COMBO_MAX: 3,           // コンボ倍率の上限。コイン1枚の得点 = 倍率。E2 の ±3 には掛けない
+  RANKS: [['S', 90], ['A', 70], ['B', 50]],   // 終了時のランクの下限点。仮置き(DEV01 の v3 ログで決め直す)
+
   BOT_DECIDE_MS: 100,     // Lv1 Bot が向きを決め直す間隔(ms)。§4「一定間隔入力」
 
   POST_URL: 'https://script.google.com/macros/s/AKfycbw2o4cJq06FcPfLlWfJww9uN27E116dkbLbcXe2k1LrYj3kM_G_-mUHG0rqX2QtJnOZ/exec',   // ログ送信先(GAS)。null ならダウンロードのみ
   SEED_OVERRIDE: null,    // 再現テスト用にseedを固定する。null なら毎セッション新規
-  VERSION: 'v2',
+  VERSION: 'v3',
 };
 const LOG_INTERVAL_MS = 1000 / CONFIG.LOG_HZ;   // 33.333... ms
 /* イベント1件が最大で占有する時間。窓割り当て時の衝突回避に使う */
@@ -116,6 +129,7 @@ const state = {
   coins: [],              // {x, y, alive}
   blockers: [],           // 通行不可の矩形{x,y,w,h}。現状はE1の板だけ。壁を足すならここ
   score: 0,
+  combo: { mult: 1, lastAt: -Infinity },   // コンボ倍率と直前の取得時刻(ms)。ログには残さない
   session: null,          // セッションメタ(startGame で作る)
   frames: [],             // frameログ本体
   events: [],             // eventログ本体(生の事実のみ)
@@ -255,6 +269,9 @@ function buildView() {
       .map((c) => Object.freeze({ x: c.x, y: c.y, size: CONFIG.COIN_SIZE }))),
     objects: Object.freeze(objects),
     npc_text: npcText,
+    /* 人間は HUD で倍率を見ているので Bot にも渡す(§4 情報の対称性) */
+    combo: Object.freeze({ mult: state.combo.mult,
+      remain_ms: Math.max(0, CONFIG.COMBO_WINDOW_MS - (state.t_ms - state.combo.lastAt)) }),
   });
 }
 
@@ -321,6 +338,7 @@ function loop(now) {
   state.keysNow = InputLayer.read(buildView(), dt);
 
   update(dt);
+  updateFx(dt);
   recordFrames();
   render();
   updateHud();
@@ -528,12 +546,18 @@ function update(dt) {
     if (hitsBlocker(p.x, p.y, b)) p.y = clamp(p.vy > 0 ? b.y - S : b.y + b.h, 0, CONFIG.H - S);
   }
 
-  /* コイン取得判定 */
+  /* コイン取得判定。コンボ(v3):前の取得から COMBO_WINDOW_MS 以内なら倍率を1段上げる。
+     倍率はログに残さないが、frames の score の増え分が倍率なので解析側で復元できる */
+  const cb = state.combo;
+  if (state.t_ms - cb.lastAt > CONFIG.COMBO_WINDOW_MS) cb.mult = 1;   // HUD の表示を戻す
   for (const c of state.coins) {
     if (!c.alive) continue;
     if (overlaps(p.x, p.y, CONFIG.PLAYER_SIZE, c.x, c.y, CONFIG.COIN_SIZE)) {
       c.alive = false;
-      state.score += 1;
+      cb.mult = (state.t_ms - cb.lastAt <= CONFIG.COMBO_WINDOW_MS) ? Math.min(cb.mult + 1, CONFIG.COMBO_MAX) : 1;
+      cb.lastAt = state.t_ms;
+      state.score += cb.mult;
+      pickupFx(c, cb.mult);
     }
   }
   /* 5個すべて取り切ったら5個とも再配置 */
@@ -565,23 +589,91 @@ function respawnCoins() {
 }
 
 /* =========================================================================
- * 8. 描画 — 塗りつぶし矩形のみ(見た目の調整はしない)
+ * 8. 描画と演出(v3)
+ *    イベントの色(E1 の緑・E2 の赤と灰・NPC の白)は通常の描画に使わない。
+ *    条件Bでイベントに似たものが見えると A/B の差が崩れる。イベントには音も演出も付けない
+ *    (E3 は告知なしのまま)。演出はゲームの状態にもログにも入れず、乱数は Math.random を
+ *    使う(seed 付きの prng を消費するとコイン配置の再現性が崩れる)
  * ========================================================================= */
-function render() {
-  ctx.fillStyle = '#111';
-  ctx.fillRect(0, 0, CONFIG.W, CONFIG.H);
+const fx = { parts: [], pops: [], trail: [] };   // 粒子・得点のポップアップ・自機の残像
+let audio = null;         // AudioContext。自動再生の制限があるのでスタートのクリック時に作る
+let muted = false;
 
-  ctx.fillStyle = '#ffd23f';
+function pickupFx(c, mult) {
+  const x = c.x + CONFIG.COIN_SIZE / 2, y = c.y + CONFIG.COIN_SIZE / 2;
+  for (let i = 0; i < 6 + 3 * mult; i++) {
+    const a = Math.random() * Math.PI * 2, v = 50 + Math.random() * 100;
+    fx.parts.push({ x: x, y: y, vx: Math.cos(a) * v, vy: Math.sin(a) * v, life: 0.5 });
+  }
+  fx.pops.push({ x: x, y: y - 8, text: '+' + mult, life: 0.8 });
+  beep(mult);
+}
+
+/* 取得音。伝える内容はスコアの変化と同じ(人間だけの手がかりにしない)。倍率が上がるほど高く鳴る */
+function beep(mult) {
+  if (muted || !audio) return;
+  const t = audio.currentTime, o = audio.createOscillator(), g = audio.createGain();
+  o.type = 'triangle';
+  o.frequency.value = 520 * Math.pow(1.26, mult - 1);
+  g.gain.setValueAtTime(0.12, t);
+  g.gain.exponentialRampToValueAtTime(0.001, t + 0.15);
+  o.connect(g); g.connect(audio.destination);
+  o.start(t); o.stop(t + 0.15);
+}
+
+function updateFx(dt) {
+  const k = Math.pow(0.02, dt);                  // 粒子の減速(フレームレートに依らない)
+  for (const q of fx.parts) { q.x += q.vx * dt; q.y += q.vy * dt; q.vx *= k; q.vy *= k; q.life -= dt; }
+  for (const q of fx.pops) { q.y -= 30 * dt; q.life -= dt; }
+  fx.parts = fx.parts.filter((q) => q.life > 0);
+  fx.pops = fx.pops.filter((q) => q.life > 0);
+  fx.trail.push({ x: state.player.x, y: state.player.y });
+  if (fx.trail.length > 8) fx.trail.shift();
+}
+
+function disc(x, y, r) { ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.fill(); }
+
+function render() {
+  ctx.fillStyle = '#0e1220';
+  ctx.fillRect(0, 0, CONFIG.W, CONFIG.H);
+  ctx.fillStyle = '#161c30';                     // 背景の格子
+  for (let x = 40; x < CONFIG.W; x += 40) ctx.fillRect(x, 0, 1, CONFIG.H);
+  for (let y = 40; y < CONFIG.H; y += 40) ctx.fillRect(0, y, CONFIG.W, 1);
+
+  /* コイン。芯は当たり判定(COIN_SIZE の正方形)とほぼ同じ大きさに保ち、外側は淡い光だけ */
+  const pulse = 0.5 + 0.5 * Math.sin(state.t_ms / 180);
   for (const c of state.coins) {
-    if (c.alive) ctx.fillRect(c.x, c.y, CONFIG.COIN_SIZE, CONFIG.COIN_SIZE);
+    if (!c.alive) continue;
+    const cx = c.x + CONFIG.COIN_SIZE / 2, cy = c.y + CONFIG.COIN_SIZE / 2;
+    ctx.fillStyle = 'rgba(255,210,63,' + (0.10 + 0.12 * pulse).toFixed(2) + ')';
+    disc(cx, cy, CONFIG.COIN_SIZE);
+    ctx.fillStyle = '#ffd23f';
+    disc(cx, cy, CONFIG.COIN_SIZE / 2 + 0.5);
   }
 
   const act = state.activeEvent;
   if (act) renderEvent(act);
 
+  /* 自機。残像は後ろに薄く引くだけで、本体の外へ光をはみ出させない(見た目=当たり判定) */
+  const S = CONFIG.PLAYER_SIZE, p = state.player;
+  fx.trail.forEach((t, i) => {
+    ctx.fillStyle = 'rgba(78,163,255,' + (0.03 * (i + 1)).toFixed(2) + ')';
+    ctx.fillRect(t.x, t.y, S, S);
+  });
   ctx.fillStyle = '#4ea3ff';
-  const p = state.player;
-  ctx.fillRect(p.x, p.y, CONFIG.PLAYER_SIZE, CONFIG.PLAYER_SIZE);
+  ctx.fillRect(p.x, p.y, S, S);
+  ctx.fillStyle = '#cfe6ff';
+  ctx.fillRect(p.x + 4, p.y + 4, S - 8, S - 8);
+
+  for (const q of fx.parts) {
+    ctx.fillStyle = 'rgba(255,226,122,' + Math.min(1, q.life * 2).toFixed(2) + ')';
+    ctx.fillRect(q.x - 1.5, q.y - 1.5, 3, 3);
+  }
+  ctx.font = 'bold 15px system-ui, sans-serif';
+  for (const q of fx.pops) {
+    ctx.fillStyle = 'rgba(255,226,122,' + Math.min(1, q.life / 0.4).toFixed(2) + ')';
+    ctx.fillText(q.text, q.x - 7, q.y);
+  }
 }
 
 /* 条件Bではここに来ない。E3は告知なしなので何も描かない */
@@ -613,6 +705,8 @@ function updateHud() {
   const remain = Math.max(0, CONFIG.DURATION_MS - state.t_ms) / 1000;
   $('hudScore').textContent = 'スコア: ' + state.score;
   $('hudTime').textContent = '残り: ' + remain.toFixed(1) + ' 秒';
+  $('hudCombo').textContent = 'コンボ ×' + state.combo.mult;
+  $('hudCombo').classList[state.combo.mult > 1 ? 'add' : 'remove']('on');
 }
 
 /* =========================================================================
@@ -683,6 +777,9 @@ function startGame() {
   state.phase = 'playing';
   state.t_ms = 0;
   state.score = 0;
+  state.combo = { mult: 1, lastAt: -Infinity };
+  fx.parts = []; fx.pops = []; fx.trail = [];
+  try { audio = audio || new (window.AudioContext || window.webkitAudioContext)(); } catch (e) { audio = null; }
   state.frames = [];
   state.events = [];
   state.eventPlan = (condition === 'A') ? planEvents() : [];   // 条件Bはベースライン(§2)
@@ -719,9 +816,15 @@ function endGame() {
   const payload = { session: state.session, frames: state.frames, events: state.events };
   logText = buildJsonText(payload);
 
-  $('finalScore').textContent =
-    '終了 — 最終スコア: ' + state.score +
-    '(記録フレーム数: ' + state.frames.length + ' / イベント: ' + state.events.length + '件)';
+  /* 目標(v3):ランクと自己ベスト。自己ベストは人間のプレイだけで更新する */
+  const best = loadBest();
+  const isBest = state.session.actor_type === 'human' && state.score > best;
+  if (isBest) saveBest(state.score);
+  $('rank').textContent = (CONFIG.RANKS.find((r) => state.score >= r[1]) || ['C'])[0];
+  $('finalScore').textContent = 'スコア ' + state.score + ' / 自己ベスト ' + Math.max(best, isBest ? state.score : 0) +
+    (isBest ? '(更新)' : '');
+  /* 参加者には出さない。イベントの件数が見えると条件の違いに気づかれる */
+  $('devInfo').textContent = PART ? '' : '記録フレーム数: ' + state.frames.length + ' / イベント: ' + state.events.length + '件';
   $('fileNameLabel').textContent = state.session.session_id + '.json';
   $('jsonOut').value = logText;
   $('endPanel').classList.remove('hidden');
@@ -755,6 +858,10 @@ function buildJsonText(payload) {
          block('frames', payload.frames) +
          block('events', payload.events) + '\n}\n';
 }
+
+/* 自己ベストはブラウザに保存する。使えない環境(プライベートモード等)では 0 扱い */
+function loadBest() { try { return Number(localStorage.getItem('coin-game-best')) || 0; } catch (e) { return 0; } }
+function saveBest(v) { try { localStorage.setItem('coin-game-best', String(v)); } catch (e) { /* 保存できなくても続ける */ } }
 
 /* =========================================================================
  * 11. ダウンロード
@@ -791,6 +898,11 @@ const nextSession = () => { setPart(1, 'アンケートの「2本目」に戻っ
 if (PART) { setPart(0, 'アンケートの「1本目」に答えてから「次へ」を押してください。'); $('setup').classList.add('hidden'); $('jsonOut').classList.add('hidden'); }
 $('btnStart').addEventListener('click', startGame);
 $('btnNext').addEventListener('click', nextSession);
+$('btnMute').addEventListener('click', () => {
+  muted = !muted;
+  $('btnMute').textContent = muted ? '音: オフ' : '音: オン';
+  $('btnMute').blur();      // フォーカスが残ると Space/Enter で切り替わってしまう
+});
 $('btnDownload').addEventListener('click', downloadLog);
 
 render();
