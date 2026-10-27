@@ -4,13 +4,13 @@
 <meta charset="utf-8">
 <title>コイン集めゲーム</title>
 <style>
-  :root { --bg: #0b0e17; --panel: #151a2a; --line: #2a3150; --text: #e8ecf5; --sub: #9aa3bd; --gold: #ffd23f; }
+  :root { --bg: #0f0e1d; --panel: #1b1934; --line: #33305a; --text: #e8ecf5; --sub: #9aa3bd; --gold: #ffd23f; }
   body { font-family: system-ui, sans-serif; margin: 16px; background: var(--bg); color: var(--text); }
   #hud { font-size: 18px; margin-bottom: 6px; display: flex; align-items: center; gap: 28px; max-width: 800px; }
   #hudCombo { color: var(--sub); min-width: 7em; }
   #hudCombo.on { color: var(--gold); font-weight: bold; }
   #btnMute { margin-left: auto; font-size: 13px; padding: 3px 10px; }
-  canvas { border-radius: 8px; background: #0e1220; display: block; box-shadow: 0 0 0 1px var(--line); }
+  canvas { border-radius: 8px; background: #16142b; display: block; box-shadow: 0 0 0 1px var(--line); }
   .panel { border: 1px solid var(--line); border-radius: 8px; background: var(--panel); padding: 12px; margin-top: 12px; max-width: 774px; }
   .panel label { margin-right: 14px; }
   .panel input, .panel select { font-size: 14px; }
@@ -76,7 +76,7 @@ const CONFIG = {
   H: 600,                 // キャンバス高さ(px)
   PLAYER_SIZE: 16,        // プレイヤーの一辺(px)
   SPEED: 200,             // 移動速度(px/秒)
-  COIN_SIZE: 8,           // コインの一辺(px)
+  COIN_SIZE: 12,          // コインの一辺(px)。8px は見えにくかったので v3 で 12px に上げた
   COIN_COUNT: 5,          // 同時に存在するコイン数
   MARGIN: 40,             // コイン配置時に外周から空ける距離(px)
   RESPAWN_MIN_DIST: 40,   // 再配置時にプレイヤー中心から離す最小距離(px)
@@ -632,38 +632,67 @@ function updateFx(dt) {
 }
 
 function disc(x, y, r) { ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.fill(); }
+/* 角丸の四角。roundRect が無いブラウザでは普通の四角で描く */
+function blob(x, y, w, h, r) {
+  if (!ctx.roundRect) { ctx.fillRect(x, y, w, h); return; }
+  ctx.beginPath(); ctx.roundRect(x, y, w, h, r); ctx.fill();
+}
 
 function render() {
-  ctx.fillStyle = '#0e1220';
+  ctx.fillStyle = '#16142b';
   ctx.fillRect(0, 0, CONFIG.W, CONFIG.H);
-  ctx.fillStyle = '#161c30';                     // 背景の格子
-  for (let x = 40; x < CONFIG.W; x += 40) ctx.fillRect(x, 0, 1, CONFIG.H);
-  for (let y = 40; y < CONFIG.H; y += 40) ctx.fillRect(0, y, CONFIG.W, 1);
+  ctx.fillStyle = '#211e3d';                     // 背景の水玉
+  for (let y = 20; y < CONFIG.H; y += 40) {
+    for (let x = (y / 40) % 2 ? 40 : 20; x < CONFIG.W; x += 40) disc(x, y, 2);
+  }
 
-  /* コイン。芯は当たり判定(COIN_SIZE の正方形)とほぼ同じ大きさに保ち、外側は淡い光だけ */
+  /* コイン。本体は当たり判定(COIN_SIZE の正方形)に内接する円で、外側は淡い光だけ */
   const pulse = 0.5 + 0.5 * Math.sin(state.t_ms / 180);
+  const R = CONFIG.COIN_SIZE / 2;
   for (const c of state.coins) {
     if (!c.alive) continue;
-    const cx = c.x + CONFIG.COIN_SIZE / 2, cy = c.y + CONFIG.COIN_SIZE / 2;
+    const cx = c.x + R, cy = c.y + R;
     ctx.fillStyle = 'rgba(255,210,63,' + (0.10 + 0.12 * pulse).toFixed(2) + ')';
-    disc(cx, cy, CONFIG.COIN_SIZE);
+    disc(cx, cy, R + 5);
+    ctx.fillStyle = '#e8a817';                   // 縁
+    disc(cx, cy, R);
     ctx.fillStyle = '#ffd23f';
-    disc(cx, cy, CONFIG.COIN_SIZE / 2 + 0.5);
+    disc(cx, cy, R - 1.5);
+    ctx.fillStyle = '#fff3b0';                   // 光沢
+    disc(cx - R * 0.35, cy - R * 0.35, R * 0.3);
+    ctx.fillStyle = '#e8a817';                   // 真ん中の刻印
+    ctx.fillRect(cx - 0.75, cy - R * 0.4, 1.5, R * 0.8);
   }
 
   const act = state.activeEvent;
   if (act) renderEvent(act);
 
-  /* 自機。残像は後ろに薄く引くだけで、本体の外へ光をはみ出させない(見た目=当たり判定) */
+  /* 自機(水色のスライム)。輪郭は当たり判定の 16px 四方いっぱいで、外へはみ出させない
+     (見た目=当たり判定)。目は最後に動いた向きを見る。残像は後ろに薄く引くだけ */
   const S = CONFIG.PLAYER_SIZE, p = state.player;
   fx.trail.forEach((t, i) => {
-    ctx.fillStyle = 'rgba(78,163,255,' + (0.03 * (i + 1)).toFixed(2) + ')';
-    ctx.fillRect(t.x, t.y, S, S);
+    ctx.fillStyle = 'rgba(108,195,255,' + (0.03 * (i + 1)).toFixed(2) + ')';
+    blob(t.x, t.y, S, S, 6);
   });
-  ctx.fillStyle = '#4ea3ff';
-  ctx.fillRect(p.x, p.y, S, S);
-  ctx.fillStyle = '#cfe6ff';
-  ctx.fillRect(p.x + 4, p.y + 4, S - 8, S - 8);
+  ctx.fillStyle = '#3d8fd6';
+  blob(p.x, p.y, S, S, 6);
+  ctx.fillStyle = '#6cc3ff';
+  blob(p.x + 1, p.y + 1, S - 2, S - 2, 5);
+  ctx.fillStyle = 'rgba(255,255,255,0.35)';
+  blob(p.x + 3, p.y + 2.5, 5, 2.5, 1.2);
+  const d = state.lastDir || { x: 0, y: 1 };
+  const blink = (state.t_ms % 3200) < 120;      // ときどき瞬きする
+  for (const ex of [p.x + 5, p.x + 11]) {
+    const ey = p.y + 8;
+    if (blink) { ctx.fillStyle = '#1b2440'; ctx.fillRect(ex - 1.5, ey, 3, 1); continue; }
+    ctx.fillStyle = '#f4f8ff';
+    disc(ex, ey, 2.2);
+    ctx.fillStyle = '#1b2440';
+    disc(ex + d.x * 0.8, ey + d.y * 0.8, 1.2);
+  }
+  ctx.fillStyle = 'rgba(255,150,190,0.75)';     // ほっぺ
+  disc(p.x + 3, p.y + 11.5, 1.3);
+  disc(p.x + 13, p.y + 11.5, 1.3);
 
   for (const q of fx.parts) {
     ctx.fillStyle = 'rgba(255,226,122,' + Math.min(1, q.life * 2).toFixed(2) + ')';
