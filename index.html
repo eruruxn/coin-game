@@ -1,0 +1,800 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>コイン集めゲーム</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 16px; background: #f5f5f5; color: #222; }
+  #hud { font-size: 18px; margin-bottom: 6px; }
+  #hud span { margin-right: 28px; }
+  canvas { border: 1px solid #333; background: #111; display: block; }
+  .panel { border: 1px solid #ccc; background: #fff; padding: 12px; margin-top: 12px; max-width: 800px; }
+  .panel label { margin-right: 14px; }
+  .panel input, .panel select { font-size: 14px; }
+  .note { color: #666; font-size: 13px; }
+  textarea { width: 100%; height: 220px; font-family: monospace; font-size: 11px; margin-top: 8px; }
+  button { font-size: 15px; padding: 6px 14px; }
+  .hidden { display: none; }
+</style>
+</head>
+<body>
+
+<div id="hud">
+  <span id="hudScore">スコア: 0</span>
+  <span id="hudTime">残り: 60.0 秒</span>
+</div>
+
+<canvas id="cv" width="800" height="600"></canvas>
+
+<div id="startPanel" class="panel">
+  <span id="setup"><label>操作者
+    <select id="inActor">
+      <option value="human" selected>人間</option>
+      <option value="bot-l1">Bot Lv1</option>
+    </select>
+  </label>
+  <label>被験者ID <input id="inSubject" value="P01" size="8"></label>
+  <label>条件
+    <select id="inCondition">
+      <option value="A">A(イベントあり)</option>
+      <option value="B" selected>B(イベントなし)</option>
+    </select>
+  </label>
+  <label>セッション番号 <input id="inSession" value="01" size="4"></label></span>
+  <button id="btnStart">スタート</button>
+  <p class="note">WASDで移動。60秒でコインを集める。</p>
+</div>
+
+<div id="endPanel" class="panel hidden">
+  <div id="finalScore"></div>
+  <p>
+    <button id="btnNext" class="hidden">次へ</button> <button id="btnDownload">ログをダウンロード</button>
+    <span id="fileNameLabel" class="note"></span>
+    <span id="sendState" class="note"></span>
+  </p>
+  <p id="endNote" class="note">もう一度プレイするにはページを再読み込みする。</p>
+  <textarea id="jsonOut" readonly></textarea>
+</div>
+
+<script>
+'use strict';
+
+/* =========================================================================
+ * 1. CONFIG — 調整しうる数値はすべてここに集約する
+ * ========================================================================= */
+const CONFIG = {
+  W: 800,                 // キャンバス幅(px)
+  H: 600,                 // キャンバス高さ(px)
+  PLAYER_SIZE: 16,        // プレイヤーの一辺(px)
+  SPEED: 200,             // 移動速度(px/秒)
+  COIN_SIZE: 8,           // コインの一辺(px)
+  COIN_COUNT: 5,          // 同時に存在するコイン数
+  MARGIN: 40,             // コイン配置時に外周から空ける距離(px)
+  RESPAWN_MIN_DIST: 40,   // 再配置時にプレイヤー中心から離す最小距離(px)
+  DURATION_MS: 60000,     // 1セッションの長さ(ms)。検証時は 10000 にすると10秒で終わる
+  LOG_HZ: 30,             // frameログの記録レート(Hz)
+  MAX_DT: 0.05,           // 1フレームのdt上限(秒)
+
+  /* --- 探査イベント(計画書§3)。条件Aのみ発生し、Bでは一切出さない --- */
+  EVENT_WINDOWS: [[5000, 15000], [22000, 32000], [40000, 48000]],  // 発火時刻の窓(ms)
+  EVENT_GAP_MS: 500,      // イベント区間どうしを離す最小間隔(ms)
+  E1_DURATION_MS: 3000,   // E1 新規性: 表示時間
+  E1_DIST: 90,            // E1: プレイヤー中心から板の中心までの距離(px)。接触まで約0.36秒
+  E1_LONG: 200,           // E1: 板の長辺(px)。端を回れば通れる長さに留め袋小路を作らない
+  E1_SHORT: 20,           // E1: 板の短辺(px)
+  E2_TIMEOUT_MS: 10000,   // E2 意味理解: どちらも取らなかった場合の打ち切り
+  E2_BOX_SIZE: 28,        // E2: 箱の一辺(px)
+  E2_NEAR_DIST: 120,      // E2: 罠側(近く・派手)までの距離(px)
+  E2_FAR_DIST: 260,       // E2: 指示側(遠く・地味)までの距離(px)
+  E2_MIN_Y: 44,           // E2: NPCテキストと重ならないよう箱を置く最小y(px)
+  E2_REWARD: 3,           // E2: 指示側 +3 / 罠 -3
+  E3_DURATION_MS: 10000,  // E3 規則変更: 左右反転の継続時間
+
+  BOT_DECIDE_MS: 100,     // Lv1 Bot が向きを決め直す間隔(ms)。§4「一定間隔入力」
+
+  POST_URL: 'https://script.google.com/macros/s/AKfycbw2o4cJq06FcPfLlWfJww9uN27E116dkbLbcXe2k1LrYj3kM_G_-mUHG0rqX2QtJnOZ/exec',   // ログ送信先(GAS)。null ならダウンロードのみ
+  SEED_OVERRIDE: null,    // 再現テスト用にseedを固定する。null なら毎セッション新規
+  VERSION: 'v2',
+};
+const LOG_INTERVAL_MS = 1000 / CONFIG.LOG_HZ;   // 33.333... ms
+/* イベント1件が最大で占有する時間。窓割り当て時の衝突回避に使う */
+const EVENT_MAX_MS = {
+  E1: CONFIG.E1_DURATION_MS,
+  E2: CONFIG.E2_TIMEOUT_MS,
+  E3: CONFIG.E3_DURATION_MS,
+};
+
+/* =========================================================================
+ * 2. state — ゲームの状態は単一オブジェクトに集約する
+ *    phase: 'ready' | 'playing' | 'ended'
+ * ========================================================================= */
+const state = {
+  phase: 'ready',
+  t_ms: 0,                // セッション開始からの経過時間(ms)
+  player: { x: 0, y: 0, vx: 0, vy: 0 },
+  lastDir: null,          // 直近の非ゼロ移動方向{x,y}。E1の出現方向に使う
+  coins: [],              // {x, y, alive}
+  blockers: [],           // 通行不可の矩形{x,y,w,h}。現状はE1の板だけ。壁を足すならここ
+  score: 0,
+  session: null,          // セッションメタ(startGame で作る)
+  frames: [],             // frameログ本体
+  events: [],             // eventログ本体(生の事実のみ)
+  eventPlan: [],          // {type, t} の配列。startGame で seed から決める
+  eventIndex: 0,          // 次に発火する eventPlan の添字
+  activeEvent: null,      // 実行中イベントの表示状態 {rec, boxes, npc_text}
+  keysNow: [],            // このフレームの押下キー(1フレーム1回だけ読む)
+  nextLogAt: 0,           // 次に記録すべき時刻(ms)
+};
+
+let rafId = null;         // requestAnimationFrame のID
+let lastNow = 0;          // 前フレームの performance.now()
+let logText = '';         // endGame で作るJSON文字列(textarea/ダウンロード共用)
+
+const $ = (id) => document.getElementById(id);
+const ctx = $('cv').getContext('2d');
+
+const clamp = (v, lo, hi) => (v < lo ? lo : v > hi ? hi : v);
+const r1 = (v) => Math.round(v * 10) / 10;    // ログは小数第1位まで
+const r2 = (v) => Math.round(v * 100) / 100;  // 単位ベクトルだけ第2位まで
+
+/* 軸並行矩形どうしの重なり判定。E1の板は正方形でないので幅と高さを別に取る */
+function overlapsRect(ax, ay, aw, ah, bx, by, bw, bh) {
+  return ax < bx + bw && ax + aw > bx && ay < by + bh && ay + ah > by;
+}
+const overlaps = (ax, ay, as, bx, by, bs) => overlapsRect(ax, ay, as, as, bx, by, bs, bs);
+/* プレイヤーの左上を(x,y)に置いたとき通行不可の矩形bに重なるか */
+const hitsBlocker = (x, y, b) =>
+  overlapsRect(x, y, CONFIG.PLAYER_SIZE, CONFIG.PLAYER_SIZE, b.x, b.y, b.w, b.h);
+
+/* =========================================================================
+ * 3. 乱数 — seed から再現可能にする(mulberry32)
+ *    コイン配置もイベント計画もこの1本を通すので、session.event_seed が
+ *    分かればセッションを丸ごと再現できる。seedは毎回変える(固定すると
+ *    人間の2セッション目でコイン配置を学習してしまう)。
+ * ========================================================================= */
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return function () {
+    a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+let prng = mulberry32(1);
+const rand = (lo, hi) => lo + prng() * (hi - lo);
+/* Fisher-Yates。イベント種類を窓に割り当てる順番を決める */
+function shuffled(arr) {
+  const a = arr.slice();
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(prng() * (i + 1));
+    const t = a[i]; a[i] = a[j]; a[j] = t;
+  }
+  return a;
+}
+
+/* =========================================================================
+ * 4. 入力 — InputLayer(計画書§4 仮想入力レイヤ)
+ *
+ * 人間とBotはここで合流する。GameCore は InputLayer.read() の戻り値しか
+ * 見ないので、Bot 実装時にゲーム側の変更は要らない。
+ * Bot にはゲームAPIではなく読み取り専用の view を渡す。生の state を渡すと
+ * 「Botだけが知り得る内部値」で判別できてしまい、イベント設計の効果を
+ * 主張できなくなる。
+ * ========================================================================= */
+const KEY_ORDER = ['W', 'A', 'S', 'D'];
+const CODE_TO_KEY = { KeyW: 'W', KeyA: 'A', KeyS: 'S', KeyD: 'D' };
+const keysDown = new Set();
+
+/* 被験者ID などの入力欄にフォーカスがある間は、キーをゲーム入力として取らない。
+   取ると preventDefault が効いて WASD が打ち込めなくなる(DEV01 の D が入らない) */
+function isTyping(e) {
+  const t = e.target;
+  if (!t || !t.tagName) return false;
+  const n = t.tagName.toUpperCase();
+  return n === 'INPUT' || n === 'TEXTAREA' || n === 'SELECT';
+}
+
+window.addEventListener('keydown', (e) => {
+  if (isTyping(e)) return;
+  const k = CODE_TO_KEY[e.code];      // e.code はキー配列に依存しないので JIS/US 両対応
+  if (!k) return;
+  keysDown.add(k);
+  e.preventDefault();
+});
+window.addEventListener('keyup', (e) => {
+  const k = CODE_TO_KEY[e.code];
+  if (!k) return;
+  keysDown.delete(k);
+  e.preventDefault();
+});
+/* タブ切り替え中の keyup を取りこぼすと押しっぱなしになるので、フォーカスを失ったら全解除 */
+window.addEventListener('blur', () => keysDown.clear());
+
+const InputLayer = {
+  source: 'human',        // 'human' | 'bot'
+  botAgent: null,         // { step(view, dt): ['W','D'] のような配列を返す }
+  /* 常に W,A,S,D の順で返す。"WD" と "DW" が混在しないので解析側の比較が安定する */
+  read(view, dt) {
+    if (this.source === 'bot') {
+      const raw = this.botAgent ? this.botAgent.step(view, dt) : null;
+      const set = new Set(Array.isArray(raw) ? raw.map((k) => String(k).toUpperCase()) : []);
+      return KEY_ORDER.filter((k) => set.has(k));
+    }
+    return KEY_ORDER.filter((k) => keysDown.has(k));
+  },
+};
+
+/* Bot に見せる読み取り専用ビュー。人間が画面から得られる情報だけを入れる。
+   E3(規則変更)は告知なしのイベントなので、反転中であることは含めない。
+   E2 でどちらが罠かも入れない(見た目の派手さ flashy と npc_text だけ渡し、
+   意味を読み取れるかを試す)。 */
+function buildView() {
+  const p = state.player;
+  const act = state.activeEvent;
+  const objects = [];
+  let npcText = null;
+  if (act && act.rec.event_type === 'E1') {
+    /* 人間は画面で板だと分かる。隠すと人間有利になり§4のInputLayerの前提が崩れる */
+    objects.push(Object.freeze({ type: 'glow', blocking: true,
+      x: act.rec.x, y: act.rec.y, w: act.rec.w, h: act.rec.h }));
+  }
+  if (act && act.rec.event_type === 'E2') {
+    for (const b of act.boxes) {
+      objects.push(Object.freeze({
+        type: 'box', side: b.side, x: b.x, y: b.y, size: CONFIG.E2_BOX_SIZE, flashy: b.flashy,
+      }));
+    }
+    npcText = act.npc_text;
+  }
+  return Object.freeze({
+    t_ms: state.t_ms,
+    score: state.score,
+    player: Object.freeze({ x: p.x, y: p.y, vx: p.vx, vy: p.vy, size: CONFIG.PLAYER_SIZE }),
+    coins: Object.freeze(state.coins.filter((c) => c.alive)
+      .map((c) => Object.freeze({ x: c.x, y: c.y, size: CONFIG.COIN_SIZE }))),
+    objects: Object.freeze(objects),
+    npc_text: npcText,
+  });
+}
+
+/* Lv1 Bot(計画書§4「単純スクリプト:最近傍コインへ直進、一定間隔入力」)
+ *
+ * イベントへの振る舞いは §3 の「Botの弱点」の想定にそのまま従わせる:
+ *   E1 発光体は無報酬なので目標にしない → 未知パターンへの停止・観察が無い
+ *   E2 箱があれば最優先で最も近い箱へ   → 見た目の報酬(近い・派手)を優先する
+ *   E3 反転を補正しない                 → 適応カーブが人間と異なる
+ * 罠は必ず近い側に置かれるので、Lv1 の E2 準拠率は構成上 0% に固定される。
+ * これは Lv1 の定義の帰結であって発見ではない(発表・卒論でそう明記する)。 */
+const BotL1 = {
+  acc: 0,                 // 前回の判断からの経過(ms)
+  keys: [],               // 次の判断まで押し続けるキー
+  reset() { this.acc = Infinity; this.keys = []; },   // Infinity = 初回は即決める
+  step(view, dt) {
+    /* 判断間隔はフレーム数ではなく時間で数える。60Hzでも120Hzでも同じ間隔になる */
+    this.acc += dt * 1000;
+    if (this.acc < CONFIG.BOT_DECIDE_MS) return this.keys;
+    this.acc = 0;
+
+    const pc = { x: view.player.x + view.player.size / 2, y: view.player.y + view.player.size / 2 };
+    const boxes = view.objects.filter((o) => o.type === 'box');
+    const targets = boxes.length ? boxes : view.coins;
+    let best = null, bd = Infinity;
+    for (const t of targets) {
+      const tx = t.x + t.size / 2, ty = t.y + t.size / 2;
+      const d = Math.hypot(tx - pc.x, ty - pc.y);
+      if (d < bd) { bd = d; best = { x: tx, y: ty }; }
+    }
+    this.keys = [];
+    if (best) {
+      if (best.x - pc.x > 2) this.keys.push('D');
+      else if (best.x - pc.x < -2) this.keys.push('A');
+      if (best.y - pc.y > 2) this.keys.push('S');
+      else if (best.y - pc.y < -2) this.keys.push('W');
+    }
+    return this.keys;
+  },
+};
+/* 開始パネルの「操作者」の値 → 入力源。Lv2以降もここに足す */
+const AGENTS = { 'bot-l1': BotL1 };
+
+/* =========================================================================
+ * 5. ループ
+ * ========================================================================= */
+function loop(now) {
+  if (state.phase !== 'playing') return;
+
+  let dt = (now - lastNow) / 1000;
+  lastNow = now;
+  if (!isFinite(dt) || dt < 0) dt = 0;
+  /* タブ非表示から復帰すると dt が数秒になり、プレイヤーが瞬間移動してしまう。
+     上限を設けて弾く。結果としてコマ落ち中はゲーム内時間が実時間より遅れるが、
+     frameログの本数(60秒 x 30Hz = 1800)は保たれる。 */
+  if (dt > CONFIG.MAX_DT) dt = CONFIG.MAX_DT;
+
+  state.t_ms += dt * 1000;
+  if (state.t_ms > CONFIG.DURATION_MS) state.t_ms = CONFIG.DURATION_MS;
+
+  /* 入力はここで1回だけ読む。update() と recordFrames() が別々に読むと、
+     Bot のように毎回生成する入力源では「移動に使った入力」と「ログに残る入力」が
+     食い違う。渡す view は前フレームの描画結果に相当する(人間も同じ) */
+  state.keysNow = InputLayer.read(buildView(), dt);
+
+  update(dt);
+  recordFrames();
+  render();
+  updateHud();
+
+  if (state.t_ms >= CONFIG.DURATION_MS) { endGame(); return; }
+  rafId = requestAnimationFrame(loop);
+}
+
+/* =========================================================================
+ * 6. 探査イベント(計画書§3)
+ *    ここに残すのは生の事実だけ。準拠フラグ・反応時間・逸脱量は記録せず、
+ *    Python側で frames と合わせて計算する(§5)。定義を変えたくなったときに
+ *    再実験にならないようにするため。
+ * ========================================================================= */
+
+/* 60秒を3つの窓に分け、E1/E2/E3 をシャッフルして1つずつ割り当てる。
+   各窓の中で発火時刻をランダムに引くが、次の窓の開始までに自分の区間
+   (E3=10秒 / E2=最大10秒)が終わるよう上限を絞る。イベントどうしが
+   重なると、どちらへの反応か切り分けられなくなる。 */
+function planEvents() {
+  const types = shuffled(['E1', 'E2', 'E3']);
+  const wins = CONFIG.EVENT_WINDOWS;
+  const plan = [];
+  let prevEnd = -Infinity;
+  for (let i = 0; i < wins.length; i++) {
+    const type = types[i];
+    const dur = EVENT_MAX_MS[type];
+    const nextStart = (i + 1 < wins.length) ? wins[i + 1][0] : CONFIG.DURATION_MS;
+    const lo = Math.max(wins[i][0], prevEnd + CONFIG.EVENT_GAP_MS);
+    /* 上限から MAX_DT ぶん引くのは、実際の発火が最大1フレーム遅れても
+       担当窓を出ないようにするため */
+    const hi = Math.min(wins[i][1] - CONFIG.MAX_DT * 1000,
+                        nextStart - dur - CONFIG.EVENT_GAP_MS);
+    const t = Math.round(rand(lo, Math.max(lo, hi)));   // DURATION_MSを縮めた検証時は hi<lo になりうる
+    plan.push({ type: type, t: t });
+    prevEnd = t + dur;
+  }
+  return plan;
+}
+
+function updateEvents() {
+  const act = state.activeEvent;
+  if (act) {
+    if (act.rec.event_type === 'E2') stepE2(act);
+    /* stepE2 が箱の接触で終了させた場合は state.activeEvent が null になっている */
+    if (state.activeEvent === act && state.t_ms >= act.rec.t_end_ms) {
+      if (act.rec.event_type === 'E2') act.rec.timed_out = true;
+      state.activeEvent = null;
+    }
+    return;                          // 同時に2つ走らせない(窓設計で重ならないが保険)
+  }
+  const next = state.eventPlan[state.eventIndex];
+  if (next && state.t_ms >= next.t) fireEvent(next, state.eventIndex);
+}
+
+function fireEvent(planned, index) {
+  const t = Math.round(state.t_ms);
+  const rec = {
+    event_id: 'e' + (index + 1),
+    event_type: planned.type,
+    t_trigger_ms: t,
+    t_end_ms: t + EVENT_MAX_MS[planned.type],
+  };
+  const act = { rec: rec, boxes: null, npc_text: null };
+  if (planned.type === 'E1') setupE1(rec);
+  if (planned.type === 'E2') setupE2(rec, act);
+  if (planned.type === 'E3') rec.axis = 'horizontal';
+  state.events.push(rec);
+  state.activeEvent = act;
+  state.eventIndex = index + 1;
+}
+
+/* E1 新規性: 進行方向の 90px 先に、進行方向と垂直な板を出す。通り抜けられない。
+   無報酬のままにするのは9/4の決定どおり(利得を付けると報酬の取得を測ることになる)。
+   updateEvents は移動処理より前に呼ばれるので p.vx/vy は前フレームの速度 */
+function setupE1(rec) {
+  const p = state.player;
+  const cx = p.x + CONFIG.PLAYER_SIZE / 2;
+  const cy = p.y + CONFIG.PLAYER_SIZE / 2;
+  let ux = p.vx, uy = p.vy;
+  if (ux === 0 && uy === 0 && state.lastDir) { ux = state.lastDir.x; uy = state.lastDir.y; }
+  /* その向きに板を置くには「中心から板の外端まで」の余地が要る。足りない向きの成分は
+     落とす。足りないまま置くと clamp で板がプレイヤーの上に戻り、update() の
+     「既に重なっている板は無視」(閉じ込め防止)に当たって板がまるごと効かなくなる。
+     板は描画されるのですり抜けに気づけない。壁ちょうどではなく壁から NEED px の帯が
+     対象で、壁沿いに滑る実際の進路に合わせるのが正しい */
+  const need = CONFIG.E1_DIST + CONFIG.E1_SHORT / 2;
+  if ((ux < 0 && cx < need) || (ux > 0 && cx > CONFIG.W - need)) ux = 0;
+  if ((uy < 0 && cy < need) || (uy > 0 && cy > CONFIG.H - need)) uy = 0;
+  if (ux === 0 && uy === 0) { ux = CONFIG.W / 2 - cx; uy = CONFIG.H / 2 - cy; }
+  let len = Math.hypot(ux, uy);
+  if (len === 0) { ux = 1; uy = 0; len = 1; }   // 静止したまま画面中央にいる場合
+  ux /= len; uy /= len;
+  /* 進行方向が横寄りなら縦板、縦寄りなら横板。入力は8方向なので軸に合わせれば塞げる */
+  const vertical = Math.abs(ux) >= Math.abs(uy);
+  rec.w = vertical ? CONFIG.E1_SHORT : CONFIG.E1_LONG;
+  rec.h = vertical ? CONFIG.E1_LONG : CONFIG.E1_SHORT;
+  rec.x = r1(clamp(cx + ux * CONFIG.E1_DIST - rec.w / 2, 0, CONFIG.W - rec.w));
+  rec.y = r1(clamp(cy + uy * CONFIG.E1_DIST - rec.h / 2, 0, CONFIG.H - rec.h));
+  rec.spawn_dir = { dx: r2(ux), dy: r2(uy) };
+}
+
+/* E2 意味理解: 箱2つ。罠側を近く(120px)・派手に、指示側を遠く(260px)・地味に置く。
+   画面端で置けない側は反対側に回す。距離は変えないので「罠の方が近い」関係(§3)は
+   常に保たれる。side は画面上の左右で、NPCの台詞が指すのもこれ。 */
+function setupE2(rec, act) {
+  const p = state.player;
+  const cx = p.x + CONFIG.PLAYER_SIZE / 2;
+  const cy = p.y + CONFIG.PLAYER_SIZE / 2;
+  const half = CONFIG.E2_BOX_SIZE / 2;
+  const fits = (c) => (c - half >= 0 && c + half <= CONFIG.W);
+
+  const s = prng() < 0.5 ? 1 : -1;              // どちら側に罠を出すかは seed 由来
+  let trapC = cx + s * CONFIG.E2_NEAR_DIST;
+  if (!fits(trapC)) trapC = cx - s * CONFIG.E2_NEAR_DIST;
+  let instC = cx - s * CONFIG.E2_FAR_DIST;
+  if (!fits(instC)) instC = cx + s * CONFIG.E2_FAR_DIST;
+
+  const trapSide = trapC < instC ? 'left' : 'right';
+  const instSide = trapSide === 'left' ? 'right' : 'left';
+  const y = r1(clamp(cy - half, CONFIG.E2_MIN_Y, CONFIG.H - CONFIG.E2_BOX_SIZE));
+  const jp = (side) => (side === 'left' ? '左' : '右');
+
+  act.boxes = [
+    { side: trapSide, x: r1(trapC - half), y: y, flashy: true },
+    { side: instSide, x: r1(instC - half), y: y, flashy: false },
+  ].sort((a, b) => a.x - b.x);
+  act.npc_text = 'NPC: ' + jp(trapSide) + 'の箱は罠だ。' + jp(instSide) + 'を取れ';
+
+  rec.instructed_side = instSide;
+  rec.trap_side = trapSide;
+  rec.boxes = act.boxes.map((b) => ({ side: b.side, x: b.x, y: b.y }));
+  rec.chosen_side = null;
+  rec.t_choice_ms = null;
+  rec.timed_out = false;
+  /* complied(準拠フラグ)は記録しない。chosen_side === instructed_side として
+     Python側で計算する(§5 判定ロジックはゲームに埋めない) */
+}
+
+function stepE2(act) {
+  const p = state.player;
+  const rec = act.rec;
+  for (const b of act.boxes) {
+    if (!overlaps(p.x, p.y, CONFIG.PLAYER_SIZE, b.x, b.y, CONFIG.E2_BOX_SIZE)) continue;
+    rec.chosen_side = b.side;
+    rec.t_choice_ms = Math.round(state.t_ms);
+    rec.t_end_ms = rec.t_choice_ms;
+    state.score += (b.side === rec.instructed_side ? CONFIG.E2_REWARD : -CONFIG.E2_REWARD);
+    state.activeEvent = null;
+    return;
+  }
+}
+
+/* =========================================================================
+ * 7. 更新
+ * ========================================================================= */
+function update(dt) {
+  /* イベントの更新は移動処理より前。E3 の左右反転のように入力の意味を
+     書き換えるイベントでも、この順序なら「反転後の実際の速度」がログに残る */
+  updateEvents();
+
+  const keys = state.keysNow;
+  let dx = (keys.includes('D') ? 1 : 0) - (keys.includes('A') ? 1 : 0);
+  let dy = (keys.includes('S') ? 1 : 0) - (keys.includes('W') ? 1 : 0);
+
+  /* E3 規則変更: 左右の意味を反転する。告知はしない。
+     反転はここ(キー→dx の変換)だけに掛ける。frameログの keys は生の押下のまま、
+     vx は反転後の値なので、解析側は「押したキー」と「実際の移動」を両方復元できる */
+  const act = state.activeEvent;
+  if (act && act.rec.event_type === 'E3') dx = -dx;
+
+  /* 斜め入力は正規化する。しないと斜めだけ 200*√2 ≒ 283px/秒 になり、
+     仕様(200px/秒)と食い違ううえ軌跡解析(§3 経路の曲率・逸脱量)にバイアスが乗る */
+  if (dx !== 0 && dy !== 0) { dx /= Math.SQRT2; dy /= Math.SQRT2; }
+  if (dx !== 0 || dy !== 0) state.lastDir = { x: dx, y: dy };
+
+  const p = state.player;
+  p.vx = dx * CONFIG.SPEED;
+  p.vy = dy * CONFIG.SPEED;
+  /* 通行不可の矩形は毎フレーム作り直す(E1の板は3秒で消える)。
+     押し出しは1枚を前提にしている。壁を足すなら「食い込みが最も浅い面へ1回だけ
+     押し出す」形に直す必要がある(今の形は順序依存になる) */
+  state.blockers = (act && act.rec.event_type === 'E1')
+    ? [{ x: act.rec.x, y: act.rec.y, w: act.rec.w, h: act.rec.h }] : [];
+
+  /* 画面外に出さない。衝突は軸ごとに分離して解く。まとめて解くと板に斜めで当たった
+     とき両軸とも止まり、3秒間貼り付いて動けなくなる。分離すれば板に沿って滑る。
+     速度は書き換えない。vx は意図した速度(0か200)のまま、位置だけが動かないので、
+     §5「生の事実だけ記録」のまま解析側が「vx≠0 なのに動かないフレーム」=
+     ブロックされた時間を復元できる。ログに項目を足さずに済む */
+  const x0 = p.x, y0 = p.y;
+  /* 発火時点で既に重なっている板は無視する(壁際で板が画面内に押し戻された場合)。
+     これが無いと板の中に閉じ込められ、3秒間まったく動けなくなる */
+  const solid = state.blockers.filter((b) => !hitsBlocker(x0, y0, b));
+  const S = CONFIG.PLAYER_SIZE;
+  /* 重なったら移動を取り消すのではなく、板の面に詰める。取り消すと最大1フレーム分
+     (SPEED/fps px。60fpsで3.3px)の隙間が残り、解析側で「板に接していた時間」を
+     測れなくなる */
+  p.x = clamp(x0 + p.vx * dt, 0, CONFIG.W - S);
+  for (const b of solid) {
+    if (hitsBlocker(p.x, p.y, b)) p.x = clamp(p.vx > 0 ? b.x - S : b.x + b.w, 0, CONFIG.W - S);
+  }
+  p.y = clamp(y0 + p.vy * dt, 0, CONFIG.H - S);
+  for (const b of solid) {
+    if (hitsBlocker(p.x, p.y, b)) p.y = clamp(p.vy > 0 ? b.y - S : b.y + b.h, 0, CONFIG.H - S);
+  }
+
+  /* コイン取得判定 */
+  for (const c of state.coins) {
+    if (!c.alive) continue;
+    if (overlaps(p.x, p.y, CONFIG.PLAYER_SIZE, c.x, c.y, CONFIG.COIN_SIZE)) {
+      c.alive = false;
+      state.score += 1;
+    }
+  }
+  /* 5個すべて取り切ったら5個とも再配置 */
+  if (state.coins.every((c) => !c.alive)) respawnCoins();
+}
+
+/* コインを COIN_COUNT 個ぶん配置し直す */
+function respawnCoins() {
+  const p = state.player;
+  const pcx = p.x + CONFIG.PLAYER_SIZE / 2;
+  const pcy = p.y + CONFIG.PLAYER_SIZE / 2;
+  const xMax = CONFIG.W - CONFIG.MARGIN - CONFIG.COIN_SIZE;
+  const yMax = CONFIG.H - CONFIG.MARGIN - CONFIG.COIN_SIZE;
+
+  state.coins = [];
+  for (let i = 0; i < CONFIG.COIN_COUNT; i++) {
+    let x = 0, y = 0;
+    /* 再配置直後にプレイヤーが重なっていると自動取得され、ほぼ同時刻に複数取得が
+       並んで反応時間の解析でノイズになる。近すぎたら引き直す */
+    for (let tries = 0; tries < 100; tries++) {
+      x = rand(CONFIG.MARGIN, xMax);
+      y = rand(CONFIG.MARGIN, yMax);
+      const cx = x + CONFIG.COIN_SIZE / 2;
+      const cy = y + CONFIG.COIN_SIZE / 2;
+      if (Math.hypot(cx - pcx, cy - pcy) >= CONFIG.RESPAWN_MIN_DIST) break;
+    }
+    state.coins.push({ x: x, y: y, alive: true });
+  }
+}
+
+/* =========================================================================
+ * 8. 描画 — 塗りつぶし矩形のみ(見た目の調整はしない)
+ * ========================================================================= */
+function render() {
+  ctx.fillStyle = '#111';
+  ctx.fillRect(0, 0, CONFIG.W, CONFIG.H);
+
+  ctx.fillStyle = '#ffd23f';
+  for (const c of state.coins) {
+    if (c.alive) ctx.fillRect(c.x, c.y, CONFIG.COIN_SIZE, CONFIG.COIN_SIZE);
+  }
+
+  const act = state.activeEvent;
+  if (act) renderEvent(act);
+
+  ctx.fillStyle = '#4ea3ff';
+  const p = state.player;
+  ctx.fillRect(p.x, p.y, CONFIG.PLAYER_SIZE, CONFIG.PLAYER_SIZE);
+}
+
+/* 条件Bではここに来ない。E3は告知なしなので何も描かない */
+function renderEvent(act) {
+  const rec = act.rec;
+  const s2 = CONFIG.E2_BOX_SIZE;
+  if (rec.event_type === 'E1') {
+    /* 見た目と当たり判定を一致させる。外周を光らせると人間だけが当たり判定より
+       8px広い形を見ることになり、Botとの情報の対称性(§4)が崩れる */
+    ctx.fillStyle = '#7cffb2';
+    ctx.fillRect(rec.x, rec.y, rec.w, rec.h);
+  }
+  if (rec.event_type === 'E2') {
+    for (const b of act.boxes) {
+      if (b.flashy) {                                // 罠側だけ派手に見せる(§3)
+        ctx.fillStyle = 'rgba(255,77,77,0.35)';
+        ctx.fillRect(b.x - 8, b.y - 8, s2 + 16, s2 + 16);
+      }
+      ctx.fillStyle = b.flashy ? '#ff4d4d' : '#8a8a8a';
+      ctx.fillRect(b.x, b.y, s2, s2);
+    }
+    ctx.fillStyle = '#ffffff';
+    ctx.font = '16px system-ui, sans-serif';
+    ctx.fillText(act.npc_text, 16, 28);              // イベント終了まで出し続ける
+  }
+}
+
+function updateHud() {
+  const remain = Math.max(0, CONFIG.DURATION_MS - state.t_ms) / 1000;
+  $('hudScore').textContent = 'スコア: ' + state.score;
+  $('hudTime').textContent = '残り: ' + remain.toFixed(1) + ' 秒';
+}
+
+/* =========================================================================
+ * 9. ログ記録
+ *    フレームレートに依存させず、固定間隔(33.33ms)に追いつく方式で記録する。
+ *    60fpsでも144fpsでも、一時的にコマ落ちしても frame数が 1800 に揃う。
+ *    コマ落ち中は同一座標のフレームが連続するが、欠損させるより解析しやすい。
+ * ========================================================================= */
+function recordFrames() {
+  const p = state.player;
+  const keys = state.keysNow.join('');
+  while (state.nextLogAt <= state.t_ms && state.nextLogAt < CONFIG.DURATION_MS) {
+    state.frames.push({
+      t_ms: Math.round(state.nextLogAt),
+      x: r1(p.x),
+      y: r1(p.y),
+      vx: r1(p.vx),      // 位置の差分からも再計算できるが、生の入力に近い値を残す
+      vy: r1(p.vy),
+      keys: keys,        // E3 反転中も「押したキー」をそのまま残す
+      score: state.score,
+    });
+    state.nextLogAt += LOG_INTERVAL_MS;
+  }
+}
+
+/* =========================================================================
+ * 10. 画面遷移
+ * ========================================================================= */
+function localDateStamp(d) {
+  const p2 = (n) => String(n).padStart(2, '0');
+  return '' + d.getFullYear() + p2(d.getMonth() + 1) + p2(d.getDate());
+}
+
+function startGame() {
+  /* Enter で開始すると入力欄にフォーカスが残り、そのままでは操作できない(上の
+     isTyping で弾かれる)。開始時に必ず外す */
+  if (document.activeElement && document.activeElement.blur) document.activeElement.blur();
+
+  /* 操作者の選択を InputLayer に流し込む。未知の値のときは現在の設定をそのまま使う
+     (Lv2以降や検証用のBotを外から差し込めるようにしておく) */
+  const actor = $('inActor').value;
+  if (actor === 'human') { InputLayer.source = 'human'; InputLayer.botAgent = null; }
+  else if (AGENTS[actor]) { InputLayer.source = 'bot'; InputLayer.botAgent = AGENTS[actor]; }
+  if (InputLayer.botAgent && InputLayer.botAgent.reset) InputLayer.botAgent.reset();
+
+  const subject = ($('inSubject').value || 'P00').trim();
+  const condition = $('inCondition').value;
+  const sessNo = String(($('inSession').value || '1').trim()).padStart(2, '0');
+  const now = new Date();
+  const seed = (CONFIG.SEED_OVERRIDE !== null
+    ? CONFIG.SEED_OVERRIDE
+    : Math.floor(Math.random() * 4294967296)) >>> 0;
+  prng = mulberry32(seed);
+
+  /* ファイル名・session_id は README の命名規則に従う:
+     {YYYYMMDD}_{被験者ID}_{条件}_{セッション番号2桁} 例) 20260821_P01_B_01 */
+  state.session = {
+    session_id: localDateStamp(now) + '_' + subject + '_' + condition + '_' + sessNo,
+    subject_id: subject,
+    actor_type: InputLayer.source,   // 'human' | 'bot'
+    condition: condition,
+    order: PART ? PART.order : null,   // 条件A/Bの実施順(§6 カウンターバランス)。参加者モードのみ
+    event_seed: seed,           // これがあればコイン配置とイベント計画を再現できる
+    ts_start: now.toISOString(),
+    version: CONFIG.VERSION,
+  };
+
+  state.phase = 'playing';
+  state.t_ms = 0;
+  state.score = 0;
+  state.frames = [];
+  state.events = [];
+  state.eventPlan = (condition === 'A') ? planEvents() : [];   // 条件Bはベースライン(§2)
+  state.eventIndex = 0;
+  state.activeEvent = null;
+  state.keysNow = [];
+  state.lastDir = null;
+  state.nextLogAt = 0;
+  state.player = {
+    x: (CONFIG.W - CONFIG.PLAYER_SIZE) / 2,
+    y: (CONFIG.H - CONFIG.PLAYER_SIZE) / 2,
+    vx: 0,
+    vy: 0,
+  };
+  keysDown.clear();
+  respawnCoins();
+  recordFrames();               // t_ms = 0 の初期フレームをここで1本入れる
+
+  $('startPanel').classList.add('hidden');
+  $('endPanel').classList.add('hidden');
+  render();
+  updateHud();
+
+  lastNow = performance.now();
+  rafId = requestAnimationFrame(loop);
+}
+
+function endGame() {
+  state.phase = 'ended';
+  if (rafId !== null) { cancelAnimationFrame(rafId); rafId = null; }
+  keysDown.clear();
+
+  /* 生ログだけを吐く。特徴量計算・準拠判定はPython側(§5) */
+  const payload = { session: state.session, frames: state.frames, events: state.events };
+  logText = buildJsonText(payload);
+
+  $('finalScore').textContent =
+    '終了 — 最終スコア: ' + state.score +
+    '(記録フレーム数: ' + state.frames.length + ' / イベント: ' + state.events.length + '件)';
+  $('fileNameLabel').textContent = state.session.session_id + '.json';
+  $('jsonOut').value = logText;
+  $('endPanel').classList.remove('hidden');
+  updateHud();
+  sendLog(logText);
+}
+
+/* ログ送信。失敗してもセッションは成立させる(ダウンロードで回収できる)。
+   GASのウェブアプリは CORS ヘッダを返さないので no-cors で投げる。レスポンスを
+   読めないため「送った」までしか分からない。届いたかは Drive 側で確認する */
+function sendLog(text) {
+  const el = $('sendState');
+  if (!CONFIG.POST_URL) { el.textContent = '(送信先が未設定。ダウンロードで回収する)'; return; }
+  el.textContent = '送信中...';
+  fetch(CONFIG.POST_URL, {
+    method: 'POST',
+    mode: 'no-cors',
+    headers: { 'Content-Type': 'text/plain;charset=utf-8' },   // プリフライトを出さない
+    body: text,
+  }).then(() => { el.textContent = '送信した(Drive側で要確認)'; })
+    .catch(() => { el.textContent = '送信に失敗。必ずダウンロードで回収する'; });
+}
+
+/* 1フレーム1行・1イベント1行のJSON。目視確認しやすく、JSONとしても正しい */
+function buildJsonText(payload) {
+  const sessionText = JSON.stringify(payload.session, null, 2).replace(/\n/g, '\n  ');
+  const block = (name, arr) => ',\n  "' + name + '": ' + (arr.length
+    ? '[\n' + arr.map((o) => '    ' + JSON.stringify(o)).join(',\n') + '\n  ]'
+    : '[]');
+  return '{\n  "session": ' + sessionText +
+         block('frames', payload.frames) +
+         block('events', payload.events) + '\n}\n';
+}
+
+/* =========================================================================
+ * 11. ダウンロード
+ * ========================================================================= */
+function downloadLog() {
+  if (!logText) return;
+  const blob = new Blob([logText], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = state.session.session_id + '.json';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
+/* 操作者を切り替えたら被験者IDの既定も合わせる(READMEの命名規則)。手入力は上書きしない */
+$('inActor').addEventListener('change', () => {
+  const isBot = $('inActor').value !== 'human';
+  const v = $('inSubject').value.trim();
+  if (isBot && !/^BOT-/.test(v)) $('inSubject').value = 'BOT-L1';
+  if (!isBot && /^BOT-/.test(v)) $('inSubject').value = 'P01';
+});
+
+/* 予備実験の参加者モード(?id=P07&order=BA)。開始パネルを埋めて隠し、1本目→「次へ」→2本目と進める */
+const q = new URLSearchParams(location.search);
+const PART = /^P\d{2}$/.test(q.get('id')) && /^(AB|BA)$/.test(q.get('order')) ? { id: q.get('id'), order: q.get('order') } : null;
+function setPart(n, note) {   // n 本目(0始まり)。値は開始パネルに入れ、startGame は通常と同じ経路で読む
+  $('inActor').value = 'human'; $('inSubject').value = PART.id; $('inCondition').value = PART.order[n];
+  $('inSession').value = '0' + (n + 1); $('btnNext').classList[n ? 'add' : 'remove']('hidden'); $('endNote').textContent = note;
+}
+const nextSession = () => { setPart(1, 'アンケートの「2本目」に戻ってください。このタブは閉じてかまいません。'); startGame(); };
+if (PART) { setPart(0, 'アンケートの「1本目」に答えてから「次へ」を押してください。'); $('setup').classList.add('hidden'); $('jsonOut').classList.add('hidden'); }
+$('btnStart').addEventListener('click', startGame);
+$('btnNext').addEventListener('click', nextSession);
+$('btnDownload').addEventListener('click', downloadLog);
+
+render();
+updateHud();
+</script>
+</body>
+</html>
