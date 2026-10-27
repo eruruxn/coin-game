@@ -4,22 +4,24 @@
 <meta charset="utf-8">
 <title>コイン集めゲーム</title>
 <style>
-  :root { --bg: #0f0e1d; --panel: #1b1934; --line: #33305a; --text: #e8ecf5; --sub: #9aa3bd; --gold: #ffd23f; }
-  body { font-family: system-ui, sans-serif; margin: 16px; background: var(--bg); color: var(--text); }
-  #hud { font-size: 18px; margin-bottom: 6px; display: flex; align-items: center; gap: 28px; max-width: 800px; }
+  :root { --bg: #fff8ec; --panel: #ffffff; --line: #f1dcbc; --text: #5a4636; --sub: #a08a74; --gold: #e89400; }
+  * { box-sizing: border-box; }
+  body { font-family: system-ui, sans-serif; margin: 16px; background: var(--bg); color: var(--text);
+         display: flex; flex-direction: column; align-items: center; }
+  #hud { font-size: 20px; margin-bottom: 8px; display: flex; align-items: center; gap: 28px; width: 800px; }
   #hudCombo { color: var(--sub); min-width: 7em; }
   #hudCombo.on { color: var(--gold); font-weight: bold; }
   #btnMute { margin-left: auto; font-size: 13px; padding: 3px 10px; }
-  canvas { border-radius: 8px; background: #16142b; display: block; box-shadow: 0 0 0 1px var(--line); }
-  .panel { border: 1px solid var(--line); border-radius: 8px; background: var(--panel); padding: 12px; margin-top: 12px; max-width: 774px; }
+  canvas { border-radius: 14px; background: #fff6e5; display: block; box-shadow: 0 0 0 2px var(--line), 0 6px 20px rgba(160,120,60,0.15); }
+  .panel { border: 2px solid var(--line); border-radius: 14px; background: var(--panel); padding: 12px 16px; margin-top: 12px; width: 800px; }
   .panel label { margin-right: 14px; }
   .panel input, .panel select { font-size: 14px; }
   .note { color: var(--sub); font-size: 13px; }
   #rank { font-size: 40px; font-weight: bold; color: var(--gold); margin-right: 14px; }
   #finalScore { font-size: 20px; }
-  textarea { width: 100%; height: 220px; font-family: monospace; font-size: 11px; margin-top: 8px; background: #0e1220; color: var(--sub); }
-  button { font-size: 15px; padding: 6px 14px; border-radius: 6px; border: 1px solid var(--line); background: #222a44; color: var(--text); cursor: pointer; }
-  button:hover { background: #2c365a; }
+  textarea { width: 100%; height: 220px; font-family: monospace; font-size: 11px; margin-top: 8px; color: var(--sub); }
+  button { font-size: 15px; padding: 6px 16px; border-radius: 999px; border: 2px solid var(--line); background: #ffeccc; color: var(--text); cursor: pointer; }
+  button:hover { background: #ffe0ad; }
   .hidden { display: none; }
 </style>
 </head>
@@ -74,9 +76,9 @@
 const CONFIG = {
   W: 800,                 // キャンバス幅(px)
   H: 600,                 // キャンバス高さ(px)
-  PLAYER_SIZE: 16,        // プレイヤーの一辺(px)
+  PLAYER_SIZE: 24,        // プレイヤーの一辺(px)。v3 で 16 → 24(小さくて見えにくかった)
   SPEED: 200,             // 移動速度(px/秒)
-  COIN_SIZE: 12,          // コインの一辺(px)。8px は見えにくかったので v3 で 12px に上げた
+  COIN_SIZE: 16,          // コインの一辺(px)。v3 で 8 → 16(見えにくかった)
   COIN_COUNT: 5,          // 同時に存在するコイン数
   MARGIN: 40,             // コイン配置時に外周から空ける距離(px)
   RESPAWN_MIN_DIST: 40,   // 再配置時にプレイヤー中心から離す最小距離(px)
@@ -88,7 +90,7 @@ const CONFIG = {
   EVENT_WINDOWS: [[5000, 15000], [22000, 32000], [40000, 48000]],  // 発火時刻の窓(ms)
   EVENT_GAP_MS: 500,      // イベント区間どうしを離す最小間隔(ms)
   E1_DURATION_MS: 3000,   // E1 新規性: 表示時間
-  E1_DIST: 90,            // E1: プレイヤー中心から板の中心までの距離(px)。接触まで約0.36秒
+  E1_DIST: 90,            // E1: プレイヤー中心から板の中心までの距離(px)。接触まで約0.34秒
   E1_LONG: 200,           // E1: 板の長辺(px)。端を回れば通れる長さに留め袋小路を作らない
   E1_SHORT: 20,           // E1: 板の短辺(px)
   E2_TIMEOUT_MS: 10000,   // E2 意味理解: どちらも取らなかった場合の打ち切り
@@ -146,6 +148,19 @@ let logText = '';         // endGame で作るJSON文字列(textarea/ダウン�
 
 const $ = (id) => document.getElementById(id);
 const ctx = $('cv').getContext('2d');
+
+/* 表示だけをウィンドウに合わせて拡大する(v3)。ゲーム内の座標(CONFIG.W x H)とログは変えない。
+   内部の解像度は devicePixelRatio 倍にして、拡大してもぼやけないようにする */
+function fitCanvas() {
+  const cv = $('cv'), dpr = window.devicePixelRatio || 1;
+  const vw = window.innerWidth || CONFIG.W + 32, vh = window.innerHeight || CONFIG.H + 160;
+  const scale = Math.max(0.5, Math.min((vw - 32) / CONFIG.W, (vh - 160) / CONFIG.H));
+  const w = Math.round(CONFIG.W * scale);
+  cv.style.width = w + 'px'; cv.style.height = Math.round(CONFIG.H * scale) + 'px';
+  for (const id of ['hud', 'startPanel', 'endPanel']) $(id).style.width = w + 'px';
+  cv.width = Math.round(CONFIG.W * scale * dpr); cv.height = Math.round(CONFIG.H * scale * dpr);
+  ctx.setTransform(cv.width / CONFIG.W, 0, 0, cv.height / CONFIG.H, 0, 0);
+}
 
 const clamp = (v, lo, hi) => (v < lo ? lo : v > hi ? hi : v);
 const r1 = (v) => Math.round(v * 10) / 10;    // ログは小数第1位まで
@@ -632,6 +647,18 @@ function updateFx(dt) {
 }
 
 function disc(x, y, r) { ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.fill(); }
+/* 横幅を sx 倍にした円(回転するコインの見た目) */
+function coinPart(x, y, r, sx, color) {
+  ctx.fillStyle = color; ctx.beginPath(); ctx.ellipse(x, y, r * sx, r, 0, 0, Math.PI * 2); ctx.fill();
+}
+function star(x, y, rx, ry) {
+  ctx.beginPath();
+  for (let i = 0; i < 10; i++) {
+    const a = -Math.PI / 2 + i * Math.PI / 5, k = i % 2 ? 0.45 : 1;
+    ctx.lineTo(x + Math.cos(a) * rx * k, y + Math.sin(a) * ry * k);
+  }
+  ctx.fill();
+}
 /* 角丸の四角。roundRect が無いブラウザでは普通の四角で描く */
 function blob(x, y, w, h, r) {
   if (!ctx.roundRect) { ctx.fillRect(x, y, w, h); return; }
@@ -639,69 +666,69 @@ function blob(x, y, w, h, r) {
 }
 
 function render() {
-  ctx.fillStyle = '#16142b';
+  ctx.fillStyle = '#fff6e5';
   ctx.fillRect(0, 0, CONFIG.W, CONFIG.H);
-  ctx.fillStyle = '#211e3d';                     // 背景の水玉
+  ctx.fillStyle = '#ffe9c4';                     // 背景の水玉
   for (let y = 20; y < CONFIG.H; y += 40) {
-    for (let x = (y / 40) % 2 ? 40 : 20; x < CONFIG.W; x += 40) disc(x, y, 2);
+    for (let x = (y / 40) % 2 ? 40 : 20; x < CONFIG.W; x += 40) disc(x, y, 3);
   }
 
-  /* コイン。本体は当たり判定(COIN_SIZE の正方形)に内接する円で、外側は淡い光だけ */
+  /* コイン。本体は当たり判定(COIN_SIZE の正方形)に内接する金貨で、外側は淡い光だけ。
+     くるっと回るように横幅だけ縮めて戻す(当たり判定より大きくは見せない) */
   const pulse = 0.5 + 0.5 * Math.sin(state.t_ms / 180);
   const R = CONFIG.COIN_SIZE / 2;
+  const spin = 0.6 + 0.4 * Math.abs(Math.cos(state.t_ms / 400));
   for (const c of state.coins) {
     if (!c.alive) continue;
     const cx = c.x + R, cy = c.y + R;
-    ctx.fillStyle = 'rgba(255,210,63,' + (0.10 + 0.12 * pulse).toFixed(2) + ')';
+    ctx.fillStyle = 'rgba(255,190,40,' + (0.15 + 0.15 * pulse).toFixed(2) + ')';
     disc(cx, cy, R + 5);
-    ctx.fillStyle = '#e8a817';                   // 縁
-    disc(cx, cy, R);
-    ctx.fillStyle = '#ffd23f';
-    disc(cx, cy, R - 1.5);
-    ctx.fillStyle = '#fff3b0';                   // 光沢
-    disc(cx - R * 0.35, cy - R * 0.35, R * 0.3);
-    ctx.fillStyle = '#e8a817';                   // 真ん中の刻印
-    ctx.fillRect(cx - 0.75, cy - R * 0.4, 1.5, R * 0.8);
+    coinPart(cx, cy, R, spin, '#c98a00');        // 縁
+    coinPart(cx, cy, R - 2, spin, '#ffc928');    // 面
+    coinPart(cx, cy, R - 4.5, spin, '#ffdb5c');  // 内側の段
+    ctx.fillStyle = '#c98a00';                   // 刻印(星)
+    star(cx, cy, (R - 5) * spin, R - 5);
+    coinPart(cx - R * 0.35 * spin, cy - R * 0.4, R * 0.22, 1, 'rgba(255,255,240,0.85)');   // 光沢
   }
 
   const act = state.activeEvent;
   if (act) renderEvent(act);
 
-  /* 自機(水色のスライム)。輪郭は当たり判定の 16px 四方いっぱいで、外へはみ出させない
+  /* 自機(水色のスライム)。輪郭は当たり判定(PLAYER_SIZE 四方)いっぱいで、外へはみ出させない
      (見た目=当たり判定)。目は最後に動いた向きを見る。残像は後ろに薄く引くだけ */
-  const S = CONFIG.PLAYER_SIZE, p = state.player;
+  const S = CONFIG.PLAYER_SIZE, p = state.player, u = S / 16;   // u: 16px 基準の倍率
   fx.trail.forEach((t, i) => {
-    ctx.fillStyle = 'rgba(108,195,255,' + (0.03 * (i + 1)).toFixed(2) + ')';
-    blob(t.x, t.y, S, S, 6);
+    ctx.fillStyle = 'rgba(94,200,255,' + (0.04 * (i + 1)).toFixed(2) + ')';
+    blob(t.x, t.y, S, S, 8 * u);
   });
-  ctx.fillStyle = '#3d8fd6';
-  blob(p.x, p.y, S, S, 6);
-  ctx.fillStyle = '#6cc3ff';
-  blob(p.x + 1, p.y + 1, S - 2, S - 2, 5);
-  ctx.fillStyle = 'rgba(255,255,255,0.35)';
-  blob(p.x + 3, p.y + 2.5, 5, 2.5, 1.2);
+  ctx.fillStyle = '#2f8fd0';
+  blob(p.x, p.y, S, S, 8 * u);
+  ctx.fillStyle = '#5ec8ff';
+  blob(p.x + u, p.y + u, S - 2 * u, S - 2 * u, 7 * u);
+  ctx.fillStyle = 'rgba(255,255,255,0.45)';
+  blob(p.x + 3 * u, p.y + 2.5 * u, 5 * u, 2.5 * u, 1.2 * u);
   const d = state.lastDir || { x: 0, y: 1 };
   const blink = (state.t_ms % 3200) < 120;      // ときどき瞬きする
-  for (const ex of [p.x + 5, p.x + 11]) {
-    const ey = p.y + 8;
-    if (blink) { ctx.fillStyle = '#1b2440'; ctx.fillRect(ex - 1.5, ey, 3, 1); continue; }
-    ctx.fillStyle = '#f4f8ff';
-    disc(ex, ey, 2.2);
-    ctx.fillStyle = '#1b2440';
-    disc(ex + d.x * 0.8, ey + d.y * 0.8, 1.2);
+  for (const ex of [p.x + 5.5 * u, p.x + 10.5 * u]) {
+    const ey = p.y + 8 * u;
+    if (blink) { ctx.fillStyle = '#3a2a20'; ctx.fillRect(ex - 1.5 * u, ey, 3 * u, u); continue; }
+    ctx.fillStyle = '#fdfdff';
+    disc(ex, ey, 2.2 * u);
+    ctx.fillStyle = '#3a2a20';
+    disc(ex + d.x * 0.8 * u, ey + d.y * 0.8 * u, 1.2 * u);
   }
-  ctx.fillStyle = 'rgba(255,150,190,0.75)';     // ほっぺ
-  disc(p.x + 3, p.y + 11.5, 1.3);
-  disc(p.x + 13, p.y + 11.5, 1.3);
+  ctx.fillStyle = 'rgba(255,130,170,0.7)';      // ほっぺ
+  disc(p.x + 3.2 * u, p.y + 11.5 * u, 1.4 * u);
+  disc(p.x + 12.8 * u, p.y + 11.5 * u, 1.4 * u);
 
   for (const q of fx.parts) {
-    ctx.fillStyle = 'rgba(255,226,122,' + Math.min(1, q.life * 2).toFixed(2) + ')';
-    ctx.fillRect(q.x - 1.5, q.y - 1.5, 3, 3);
+    ctx.fillStyle = 'rgba(242,169,0,' + Math.min(1, q.life * 2).toFixed(2) + ')';
+    ctx.fillRect(q.x - 2, q.y - 2, 4, 4);
   }
-  ctx.font = 'bold 15px system-ui, sans-serif';
+  ctx.font = 'bold 18px system-ui, sans-serif';
   for (const q of fx.pops) {
-    ctx.fillStyle = 'rgba(255,226,122,' + Math.min(1, q.life / 0.4).toFixed(2) + ')';
-    ctx.fillText(q.text, q.x - 7, q.y);
+    ctx.fillStyle = 'rgba(224,122,0,' + Math.min(1, q.life / 0.4).toFixed(2) + ')';
+    ctx.fillText(q.text, q.x - 8, q.y);
   }
 }
 
@@ -712,8 +739,10 @@ function renderEvent(act) {
   if (rec.event_type === 'E1') {
     /* 見た目と当たり判定を一致させる。外周を光らせると人間だけが当たり判定より
        8px広い形を見ることになり、Botとの情報の対称性(§4)が崩れる */
-    ctx.fillStyle = '#7cffb2';
+    ctx.fillStyle = '#2f9e6a';                       // 明るい背景で見えるよう縁を内側に付ける
     ctx.fillRect(rec.x, rec.y, rec.w, rec.h);
+    ctx.fillStyle = '#7cffb2';
+    ctx.fillRect(rec.x + 2, rec.y + 2, rec.w - 4, rec.h - 4);
   }
   if (rec.event_type === 'E2') {
     for (const b of act.boxes) {
@@ -721,12 +750,17 @@ function renderEvent(act) {
         ctx.fillStyle = 'rgba(255,77,77,0.35)';
         ctx.fillRect(b.x - 8, b.y - 8, s2 + 16, s2 + 16);
       }
-      ctx.fillStyle = b.flashy ? '#ff4d4d' : '#8a8a8a';
+      if (b.flashy) { ctx.fillStyle = '#ff4d4d'; ctx.fillRect(b.x, b.y, s2, s2); continue; }
+      ctx.fillStyle = '#5c5c5c';                     // 地味な側は明るい背景で見えるよう縁を内側に付ける
       ctx.fillRect(b.x, b.y, s2, s2);
+      ctx.fillStyle = '#8a8a8a';
+      ctx.fillRect(b.x + 2, b.y + 2, s2 - 4, s2 - 4);
     }
+    ctx.fillStyle = 'rgba(40,30,60,0.85)';           // 明るい背景で白い文字が読めるよう帯を敷く
+    ctx.fillRect(0, 0, CONFIG.W, 40);
     ctx.fillStyle = '#ffffff';
     ctx.font = '16px system-ui, sans-serif';
-    ctx.fillText(act.npc_text, 16, 28);              // イベント終了まで出し続ける
+    ctx.fillText(act.npc_text, 16, 26);              // イベント終了まで出し続ける
   }
 }
 
@@ -934,6 +968,8 @@ $('btnMute').addEventListener('click', () => {
 });
 $('btnDownload').addEventListener('click', downloadLog);
 
+window.addEventListener('resize', () => { fitCanvas(); render(); });
+fitCanvas();
 render();
 updateHud();
 </script>
